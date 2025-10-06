@@ -20,20 +20,18 @@ from ofa.utils import make_divisible, val2list, MyNetwork
 
 __all__ = ["OFAMobileNetV3"]
 
-
 class OFAMobileNetV3(MobileNetV3):
     def __init__(
         self,
-        n_classes=1000,
+        n_classes=8,  # Changed for AffectNet (8 classes)
         bn_param=(0.1, 1e-5),
-        dropout_rate=0.1,
+        dropout_rate=0.3,  # Increased for small dataset
         base_stage_width=None,
         width_mult=1.0,
-        ks_list=3,
-        expand_ratio_list=6,
-        depth_list=4,
+        ks_list=[3, 5, 7],  # Explicit list for clarity
+        expand_ratio_list=[3, 4, 6],  # Explicit list
+        depth_list=[2, 3, 4],  # Explicit list
     ):
-
         self.width_mult = width_mult
         self.ks_list = val2list(ks_list, 1)
         self.expand_ratio_list = val2list(expand_ratio_list, 1)
@@ -55,7 +53,8 @@ class OFAMobileNetV3(MobileNetV3):
         stride_stages = [1, 2, 2, 2, 1, 2]
         act_stages = ["relu", "relu", "relu", "h_swish", "h_swish", "h_swish"]
         se_stages = [False, False, True, False, True, True]
-        n_block_list = [1] + [max(self.depth_list)] * 5
+        n_block_list = [1, 3, 3, 3, 3, 3]  # Reduced for smaller dataset
+
         width_list = []
         for base_width in base_stage_width[:-2]:
             width = make_divisible(
@@ -121,6 +120,7 @@ class OFAMobileNetV3(MobileNetV3):
                     shortcut = None
                 blocks.append(ResidualBlock(mobile_inverted_conv, shortcut))
                 feature_dim = output_channel
+
         # final expand layer, feature mix layer & classifier
         final_expand_layer = ConvLayer(
             feature_dim, final_expand_width, kernel_size=1, act_func="h_swish"
@@ -134,7 +134,7 @@ class OFAMobileNetV3(MobileNetV3):
             act_func="h_swish",
         )
 
-        classifier = LinearLayer(last_channel, n_classes, dropout_rate=dropout_rate)
+        classifier = LinearLayer(last_channel, n_classes, dropout_rate=0.3)  # Match dropout_rate
 
         super(OFAMobileNetV3, self).__init__(
             first_conv, blocks, final_expand_layer, feature_mix_layer, classifier
@@ -145,8 +145,6 @@ class OFAMobileNetV3(MobileNetV3):
 
         # runtime_depth
         self.runtime_depth = [len(block_idx) for block_idx in self.block_group_info]
-
-    """ MyNetwork required methods """
 
     @staticmethod
     def name():
@@ -221,7 +219,6 @@ class OFAMobileNetV3(MobileNetV3):
                 new_key = new_key.replace(".conv.conv.weight", ".conv.weight")
             elif ".linear.linear." in new_key:
                 new_key = new_key.replace(".linear.linear.", ".linear.")
-            ##############################################################################
             elif ".linear." in new_key:
                 new_key = new_key.replace(".linear.", ".linear.linear.")
             elif "bn." in new_key:
@@ -233,8 +230,6 @@ class OFAMobileNetV3(MobileNetV3):
             assert new_key in model_dict, "%s" % new_key
             model_dict[new_key] = state_dict[key]
         super(OFAMobileNetV3, self).load_state_dict(model_dict)
-
-    """ set, sample and get active sub-networks """
 
     def set_max_net(self):
         self.set_active_subnet(
@@ -256,22 +251,7 @@ class OFAMobileNetV3(MobileNetV3):
             if d is not None:
                 self.runtime_depth[i] = min(len(self.block_group_info[i]), d)
 
-    def set_constraint(self, include_list, constraint_type="depth"):
-        if constraint_type == "depth":
-            self.__dict__["_depth_include_list"] = include_list.copy()
-        elif constraint_type == "expand_ratio":
-            self.__dict__["_expand_include_list"] = include_list.copy()
-        elif constraint_type == "kernel_size":
-            self.__dict__["_ks_include_list"] = include_list.copy()
-        else:
-            raise NotImplementedError
-
-    def clear_constraint(self):
-        self.__dict__["_depth_include_list"] = None
-        self.__dict__["_expand_include_list"] = None
-        self.__dict__["_ks_include_list"] = None
-
-    def sample_active_subnet(self):
+    def sample_active_subnet(self, bias_smaller=False):
         ks_candidates = (
             self.ks_list
             if self.__dict__.get("_ks_include_list", None) is None
@@ -301,17 +281,17 @@ class OFAMobileNetV3(MobileNetV3):
         if not isinstance(expand_candidates[0], list):
             expand_candidates = [expand_candidates for _ in range(len(self.blocks) - 1)]
         for e_set in expand_candidates:
-            e = random.choice(e_set)
+            weights = [2.0 if e == min(e_set) else 1.0 for e in e_set] if bias_smaller else None
+            e = random.choices(e_set, weights=weights)[0] if bias_smaller else random.choice(e_set)
             expand_setting.append(e)
 
         # sample depth
         depth_setting = []
         if not isinstance(depth_candidates[0], list):
-            depth_candidates = [
-                depth_candidates for _ in range(len(self.block_group_info))
-            ]
+            depth_candidates = [depth_candidates for _ in range(len(self.block_group_info))]
         for d_set in depth_candidates:
-            d = random.choice(d_set)
+            weights = [2.0 if d == min(d_set) else 1.0 for d in d_set] if bias_smaller else None
+            d = random.choices(d_set, weights=weights)[0] if bias_smaller else random.choice(d_set)
             depth_setting.append(d)
 
         self.set_active_subnet(ks_setting, expand_setting, depth_setting)
@@ -392,8 +372,6 @@ class OFAMobileNetV3(MobileNetV3):
             "feature_mix_layer": feature_mix_layer_config,
             "classifier": classifier_config,
         }
-
-    """ Width Related Methods """
 
     def re_organize_middle_weights(self, expand_ratio_stage=0):
         for block in self.blocks[1:]:
