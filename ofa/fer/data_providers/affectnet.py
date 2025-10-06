@@ -10,9 +10,6 @@ import numpy as np
 import torch
 import torch.utils.data
 import torchvision.transforms as transforms
-import torchvision.datasets as datasets
-import pandas as pd
-from mtcnn import MTCNN
 from PIL import Image
 
 from .base_provider import DataProvider
@@ -20,17 +17,44 @@ from ofa.utils.my_dataloader import MyRandomResizedCrop, WeightedDistributedSamp
 
 __all__ = ["AffectNetDataProvider"]
 
+class AffectNetDataset(torch.utils.data.Dataset):
+    def __init__(self, image_dir, annotation_dir, transform=None):
+        self.image_dir = image_dir
+        self.annotation_dir = annotation_dir
+        self.transform = transform
+        # List all image files
+        self.image_files = [f for f in os.listdir(image_dir) if f.endswith('.jpg')]
+        self.image_ids = [os.path.splitext(f)[0] for f in self.image_files]
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, idx):
+        img_name = self.image_files[idx]
+        img_path = os.path.join(self.image_dir, img_name)
+        image = Image.open(img_path).convert('RGB')
+        
+        # Load expression label from .npy
+        img_id = self.image_ids[idx]
+        exp_path = os.path.join(self.annotation_dir, f"{img_id}_exp.npy")
+        label = int(np.load(exp_path))  # Integer label (0-7)
+
+        if self.transform:
+            image = self.transform(image)
+        
+        return image, label
+
 class AffectNetDataProvider(DataProvider):
     DEFAULT_PATH = "/dataset/affectnet"
 
     def __init__(
         self,
         save_path=None,
-        train_batch_size=256,
-        test_batch_size=512,
+        train_batch_size=64,  # Reduced for 2.91K dataset and Jetson
+        test_batch_size=128,
         valid_size=None,
-        n_worker=4,  # Lower for Jetson
-        resize_scale=0.08,
+        n_worker=2,  # Reduced for Jetson
+        resize_scale=0.5,
         distort_color="torch",
         image_size=[64, 80, 96, 128],  # FER-specific resolutions
         num_replicas=None,
@@ -170,31 +194,48 @@ class AffectNetDataProvider(DataProvider):
         raise ValueError("unable to download %s" % self.name())
 
     def train_dataset(self, _transforms):
-        return datasets.ImageFolder(self.train_path, _transforms)
+        return AffectNetDataset(
+            image_dir=os.path.join(self.save_path, "train/images"),
+            annotation_dir=os.path.join(self.save_path, "train/annotations"),
+            transform=_transforms
+        )
 
     def test_dataset(self, _transforms):
-        return datasets.ImageFolder(self.valid_path, _transforms)
+        return AffectNetDataset(
+            image_dir=os.path.join(self.save_path, "val/images"),
+            annotation_dir=os.path.join(self.save_path, "val/annotations"),
+            transform=_transforms
+        )
 
     @property
     def train_path(self):
-        return os.path.join(self.save_path, "Manually_Annotated_Images")
+        return os.path.join(self.save_path, "train/images")
 
     @property
     def valid_path(self):
-        return os.path.join(self.save_path, "Manually_Annotated_Images")
+        return os.path.join(self.save_path, "val/images")
 
     @property
     def normalize(self):
         return transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 
     def compute_class_weights(self):
-        # Load annotations to compute class weights
-        annotation_file = os.path.join(self.save_path, "training.csv")
-        df = pd.read_csv(annotation_file)
-        class_counts = df['expression'].value_counts().sort_index()
-        total_samples = len(df)
-        weights = total_samples / (len(class_counts) * class_counts)
-        return weights.values / weights.sum()
+        # Compute class weights from expression annotations
+        annotation_dir = os.path.join(self.save_path, "train/annotations")
+        image_files = [f for f in os.listdir(self.train_path) if f.endswith('.jpg')]
+        labels = []
+        for img_file in image_files:
+            img_id = os.path.splitext(img_file)[0]
+            exp_path = os.path.join(annotation_dir, f"{img_id}_exp.npy")
+            if os.path.exists(exp_path):
+                label = int(np.load(exp_path))
+                labels.append(label)
+        labels = np.array(labels)
+        class_counts = np.bincount(labels, minlength=self.n_classes)
+        total_samples = len(labels)
+        weights = total_samples / (self.n_classes * class_counts)
+        weights = weights / weights.sum()
+        return weights
 
     def build_train_transform(self, image_size=None, print_log=True):
         if image_size is None:
@@ -204,19 +245,6 @@ class AffectNetDataProvider(DataProvider):
                 "Color jitter: %s, resize_scale: %s, img_size: %s"
                 % (self.distort_color, self.resize_scale, image_size)
             )
-
-        detector = MTCNN()
-
-        def preprocess_face(img):
-            try:
-                img_np = np.array(img)
-                faces = detector.detect_faces(img_np)
-                if faces:
-                    x, y, w, h = faces[0]['box']
-                    img = img.crop((x, y, x+w, y+h))
-                return img
-            except:
-                return img  # Fallback to original if detection fails
 
         if isinstance(image_size, list):
             resize_transform_class = MyRandomResizedCrop
@@ -233,11 +261,11 @@ class AffectNetDataProvider(DataProvider):
             resize_transform_class = transforms.RandomResizedCrop
 
         train_transforms = [
-            transforms.Lambda(preprocess_face),
-            resize_transform_class(image_size, scale=(self.resize_scale, 1.0)),
+            resize_transform_class(image_size, scale=(self.resize_scale, 1.0), ratio=(0.9, 1.1), interpolation=Image.BICUBIC),
             transforms.RandomHorizontalFlip(),
-            transforms.RandomRotation(15),  # Mild rotation for FER
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+            transforms.RandomRotation(15),
+            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
+            transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
             transforms.ToTensor(),
             self.normalize,
         ]
@@ -248,23 +276,8 @@ class AffectNetDataProvider(DataProvider):
     def build_valid_transform(self, image_size=None):
         if image_size is None:
             image_size = self.active_img_size
-
-        detector = MTCNN()
-
-        def preprocess_face(img):
-            try:
-                img_np = np.array(img)
-                faces = detector.detect_faces(img_np)
-                if faces:
-                    x, y, w, h = faces[0]['box']
-                    img = img.crop((x, y, x+w, y+h))
-                return img
-            except:
-                return img
-
         return transforms.Compose(
             [
-                transforms.Lambda(preprocess_face),
                 transforms.Resize(int(math.ceil(image_size / 0.875))),
                 transforms.CenterCrop(image_size),
                 transforms.ToTensor(),
